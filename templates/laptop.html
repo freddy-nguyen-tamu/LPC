@@ -1,0 +1,97 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="header-row">
+  <div>
+    <h1>Phone ↔ Laptop Transfer</h1>
+    <p class="muted">Laptop dashboard. Scan QR from your phone to link.</p>
+  </div>
+</div>
+
+<div class="grid two">
+  <section class="card">
+    <h2>Link your phone</h2>
+    <p>Scan this QR code on the same Wi‑Fi network.</p>
+    <div class="qr-wrap">
+      <img class="qr" src="{{ url_for('qr_image') }}?url={{ phone_url | urlencode }}" alt="Pair QR code">
+    </div>
+    <div class="meta-box">
+      <div><strong>Pair link:</strong></div>
+      <div class="mono small break">{{ phone_url }}</div>
+      <div class="spacer-sm"></div>
+      <div><strong>Pair code:</strong> <span class="mono">{{ pair_code }}</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Send a file to a linked phone</h2>
+    <form id="sendToPhoneForm" class="stack-form">
+      <label for="device_id">Choose linked phone</label>
+      <select name="device_id" id="device_id" required>
+        <option value="">Select a phone</option>
+        {% for d in devices %}
+          <option value="{{ d['id'] }}">{{ d['device_name'] }} {% if d['platform'] %}({{ d['platform'] }}){% endif %}</option>
+        {% endfor %}
+      </select>
+
+      <label for="pc_file">Choose file</label>
+      <input type="file" id="pc_file" name="file" required>
+
+      <button type="submit">Queue for phone download</button>
+      <div id="sendStatus" class="status"></div>
+    </form>
+  </section>
+</div>
+
+<div class="grid two top-gap">
+  <section class="card">
+    <h2>Linked devices</h2>
+    <div id="devicesList">
+      {% if devices %}
+        {% for d in devices %}
+          <div class="list-item">
+            <div>
+              <strong>{{ d['device_name'] }}</strong>
+              <div class="small muted">{{ d['platform'] or 'unknown' }}</div>
+            </div>
+            <div class="small muted right">
+              Last seen<br>{{ d['last_seen_at'] or '-' }}
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <p class="muted">No phones linked yet.</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Recent transfers</h2>
+    <div id="transfersList">
+      {% if transfers %}
+        {% for t in transfers %}
+          <div class="list-item">
+            <div>
+              <strong>{{ t['filename'] }}</strong>
+              <div class="small muted">{{ t['direction'] }}{% if t['device_name'] %} • {{ t['device_name'] }}{% endif %}</div>
+            </div>
+            <div class="small muted right">
+              {{ t['status'] }}<br>{{ t['size_bytes'] }} bytes
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <p class="muted">No transfers yet.</p>
+      {% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  window.TRANSFER_APP = {
+    pollSeconds: {{ poll_seconds }},
+    mode: 'laptop'
+  };
+</script>
+{% endblock %}
