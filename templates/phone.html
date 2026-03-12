@@ -1,0 +1,55 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="header-row">
+  <div>
+    <h1>Phone Client</h1>
+    <p class="muted">Use your mobile browser after scanning the QR code.</p>
+  </div>
+</div>
+
+<section class="card">
+  <h2>Phone status</h2>
+  <div id="phoneIdentity" class="muted">Checking link status...</div>
+</section>
+
+<section class="card top-gap" id="pairSection">
+  <h2>Link this phone</h2>
+  <form id="pairForm" class="stack-form">
+    <label for="pair_code">Pair code</label>
+    <input type="text" id="pair_code" name="pair_code" value="{{ pair_code }}" required>
+
+    <label for="device_name">Phone name</label>
+    <input type="text" id="device_name" name="device_name" placeholder="e.g. Sam iPhone" required>
+
+    <button type="submit">Link phone</button>
+    <div id="pairStatus" class="status"></div>
+  </form>
+</section>
+
+<section class="card top-gap" id="uploadSection" style="display:none;">
+  <h2>Send file to laptop</h2>
+  <form id="phoneUploadForm" class="stack-form">
+    <label for="phone_file">Choose file</label>
+    <input type="file" id="phone_file" name="file" required>
+
+    <button type="submit">Upload to laptop</button>
+    <div id="uploadStatus" class="status"></div>
+  </form>
+</section>
+
+<section class="card top-gap" id="downloadsSection" style="display:none;">
+  <h2>Files waiting from laptop</h2>
+  <div id="pendingDownloads">
+    <p class="muted">No downloads waiting.</p>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  window.TRANSFER_APP = {
+    pollSeconds: {{ poll_seconds }},
+    mode: 'phone'
+  };
+</script>
+{% endblock %}
