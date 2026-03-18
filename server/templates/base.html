@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title if title else 'Transfer App' }}</title>
+  <title>Transfer Pro</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
-  <div class="container">
+  <div class="shell">
     {% block content %}{% endblock %}
   </div>
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
-  {% block scripts %}{% endblock %}
 </body>
 </html>

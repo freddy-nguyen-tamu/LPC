@@ -1,112 +1,37 @@
-import os
 import io
-import sqlite3
-import uuid
-import socket
-import secrets
+import math
 import mimetypes
+import os
+import secrets
+import socket
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from werkzeug.utils import secure_filename
-from flask import (
-    Flask,
-    render_template,
-    request,
-    jsonify,
-    send_file,
-    send_from_directory,
-    abort,
-)
+
 import qrcode
+from flask import Flask, abort, jsonify, render_template, request, send_file, send_from_directory
+from flask_socketio import SocketIO, emit
+from werkzeug.utils import secure_filename
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTGOING_DIR = BASE_DIR / "outgoing"
-DB_PATH = DATA_DIR / "app.db"
-
-DATA_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTGOING_DIR.mkdir(exist_ok=True)
+from config import (
+    APP_HOST,
+    APP_PORT,
+    APP_SECRET,
+    DEFAULT_CHUNK_SIZE,
+    DOWNLOAD_TOKEN_TTL_MINUTES,
+    MAX_CONTENT_LENGTH,
+    OUTGOING_DIR,
+    PAIR_CODE_TTL_MINUTES,
+    PARTIAL_DIR,
+    UPLOAD_DIR,
+)
+from crypto_utils import decrypt_payload, encrypt_payload
+from db import execute, execute_many, init_db, query_all, query_one, utc_now_iso
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GB
-app.config["SECRET_KEY"] = os.environ.get("APP_SECRET", secrets.token_hex(32))
-
-PAIR_CODE_TTL_MINUTES = 10
-DOWNLOAD_TOKEN_TTL_MINUTES = 60
-PHONE_POLL_SECONDS = 4
-
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pair_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pair_code TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            consumed_at TEXT
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_token TEXT NOT NULL UNIQUE,
-            device_name TEXT NOT NULL,
-            platform TEXT,
-            last_seen_at TEXT,
-            created_at TEXT NOT NULL,
-            linked_at TEXT NOT NULL,
-            pair_session_id INTEGER,
-            FOREIGN KEY(pair_session_id) REFERENCES pair_sessions(id)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transfers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            direction TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            stored_name TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            mime_type TEXT,
-            device_id INTEGER,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            completed_at TEXT,
-            download_token TEXT,
-            download_expires_at TEXT,
-            downloaded_at TEXT,
-            FOREIGN KEY(device_id) REFERENCES devices(id)
-        )
-        """
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def utc_now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def iso_in_future(minutes: int):
-    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+app.config["SECRET_KEY"] = APP_SECRET
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 
 def parse_iso(value: str):
@@ -125,509 +50,473 @@ def get_local_ip():
     return ip
 
 
-def build_base_url():
-    host = os.environ.get("APP_HOST", get_local_ip())
-    port = int(os.environ.get("APP_PORT", 5000))
+def build_base_url() -> str:
+    host = os.environ.get("APP_PUBLIC_HOST", get_local_ip())
+    port = int(os.environ.get("APP_PORT", APP_PORT))
     return f"http://{host}:{port}"
 
 
-def create_pair_session():
-    pair_code = secrets.token_urlsafe(24)
-    created_at = utc_now_iso()
-    expires_at = iso_in_future(PAIR_CODE_TTL_MINUTES)
+def emit_dashboard_update():
+    devices = [dict(x) for x in query_all("SELECT * FROM devices ORDER BY last_seen_at DESC")]
+    transfers = [
+        dict(x)
+        for x in query_all(
+            """
+            SELECT t.*, d.device_name
+            FROM transfers t
+            LEFT JOIN devices d ON d.id = t.device_id
+            ORDER BY t.id DESC
+            LIMIT 30
+            """
+        )
+    ]
+    socketio.emit("dashboard_update", {"devices": devices, "transfers": transfers})
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
+
+def create_pair_session():
+    created_at = utc_now_iso()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=PAIR_CODE_TTL_MINUTES)).isoformat()
+    payload = {
+        "nonce": secrets.token_urlsafe(16),
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+    encrypted_token = encrypt_payload(payload)
+    pair_session_id = execute(
         """
-        INSERT INTO pair_sessions (pair_code, created_at, expires_at)
+        INSERT INTO pair_sessions (encrypted_token, created_at, expires_at)
         VALUES (?, ?, ?)
         """,
-        (pair_code, created_at, expires_at),
+        (encrypted_token, created_at, expires_at),
     )
-    conn.commit()
-    session_id = cur.lastrowid
-    conn.close()
-    return session_id, pair_code
+    return pair_session_id, encrypted_token
 
 
-def get_active_pair_session(pair_code: str):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT * FROM pair_sessions
-        WHERE pair_code = ?
-        """,
-        (pair_code,),
-    )
-    row = cur.fetchone()
-    conn.close()
-
+def validate_pair_token(encrypted_token: str):
+    row = query_one("SELECT * FROM pair_sessions WHERE encrypted_token = ?", (encrypted_token,))
     if not row:
         return None
-
-    if row["consumed_at"] is not None:
+    if row["consumed_at"]:
         return None
-
-    if parse_iso(row["expires_at"]) < datetime.now(timezone.utc):
+    try:
+        payload = decrypt_payload(encrypted_token)
+    except ValueError:
         return None
-
+    if parse_iso(payload["expires_at"]) < datetime.now(timezone.utc):
+        return None
     return row
 
 
-def upsert_device(device_name: str, platform: str, pair_session_id: int):
-    device_token = secrets.token_urlsafe(32)
+def create_device(device_name: str, platform: str, pair_session_id: int):
     now = utc_now_iso()
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
+    device_token = secrets.token_urlsafe(32)
+    device_id = execute(
         """
-        INSERT INTO devices (
-            device_token, device_name, platform, last_seen_at, created_at, linked_at, pair_session_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO devices (device_token, device_name, platform, created_at, linked_at, last_seen_at, pair_session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (device_token, device_name, platform, now, now, now, pair_session_id),
     )
-    device_id = cur.lastrowid
-
-    cur.execute(
+    execute(
         "UPDATE pair_sessions SET consumed_at = ? WHERE id = ?",
         (now, pair_session_id),
     )
-
-    conn.commit()
-    conn.close()
+    emit_dashboard_update()
     return device_id, device_token
 
 
 def get_device_by_token(device_token: str):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM devices WHERE device_token = ?", (device_token,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+    return query_one("SELECT * FROM devices WHERE device_token = ?", (device_token,))
 
 
 def touch_device(device_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE devices SET last_seen_at = ? WHERE id = ?",
-        (utc_now_iso(), device_id),
-    )
-    conn.commit()
-    conn.close()
+    execute("UPDATE devices SET last_seen_at = ? WHERE id = ?", (utc_now_iso(), device_id))
 
 
-def allowed_file(filename: str):
-    return bool(filename and filename.strip())
-
-
-def unique_stored_name(filename: str):
+def make_safe_name(filename: str) -> str:
     safe = secure_filename(filename)
     if not safe:
         safe = f"file_{uuid.uuid4().hex}"
-    return f"{uuid.uuid4().hex}_{safe}"
+    return safe
 
 
-def create_transfer_record(direction, filename, stored_name, size_bytes, mime_type, device_id, status):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
+def partial_dir_for_transfer(transfer_id: int) -> Path:
+    path = PARTIAL_DIR / str(transfer_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_transfer_chunk_count(transfer_id: int) -> int:
+    row = query_one("SELECT COUNT(*) AS c FROM transfer_chunks WHERE transfer_id = ?", (transfer_id,))
+    return int(row["c"] if row else 0)
+
+
+def register_transfer(direction: str, filename: str, stored_name: str, mime_type: str, size_bytes: int, chunk_size: int, total_chunks: int, device_id: int, status: str, download_token=None, download_expires_at=None):
+    return execute(
         """
         INSERT INTO transfers (
-            direction, filename, stored_name, size_bytes, mime_type, device_id,
-            status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            direction, filename, stored_name, mime_type, size_bytes, chunk_size, total_chunks,
+            uploaded_chunks, status, device_id, created_at, updated_at, download_token, download_expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
         """,
         (
             direction,
             filename,
             stored_name,
-            size_bytes,
             mime_type,
-            device_id,
+            size_bytes,
+            chunk_size,
+            total_chunks,
             status,
-            utc_now_iso(),
-        ),
-    )
-    transfer_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return transfer_id
-
-
-def mark_transfer_completed(transfer_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE transfers SET status = ?, completed_at = ? WHERE id = ?",
-        ("completed", utc_now_iso(), transfer_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def create_download_job(device_id: int, filename: str, saved_path: Path):
-    size_bytes = saved_path.stat().st_size
-    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    stored_name = saved_path.name
-    download_token = secrets.token_urlsafe(32)
-    expires_at = iso_in_future(DOWNLOAD_TOKEN_TTL_MINUTES)
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO transfers (
-            direction, filename, stored_name, size_bytes, mime_type, device_id,
-            status, created_at, download_token, download_expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "pc_to_phone",
-            filename,
-            stored_name,
-            size_bytes,
-            mime_type,
             device_id,
-            "queued",
+            utc_now_iso(),
             utc_now_iso(),
             download_token,
-            expires_at,
+            download_expires_at,
         ),
     )
-    transfer_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return transfer_id, download_token
 
 
-def list_devices():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
+def update_transfer_progress(transfer_id: int):
+    uploaded_chunks = get_transfer_chunk_count(transfer_id)
+    transfer = query_one("SELECT * FROM transfers WHERE id = ?", (transfer_id,))
+    if not transfer:
+        return None
+    status = "receiving"
+    completed_at = None
+    if uploaded_chunks >= transfer["total_chunks"]:
+        status = "completed"
+        completed_at = utc_now_iso()
+    execute(
         """
-        SELECT d.*, (
-            SELECT COUNT(*) FROM transfers t WHERE t.device_id = d.id
-        ) AS transfer_count
-        FROM devices d
-        ORDER BY d.last_seen_at DESC
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def list_recent_transfers(limit=20):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT t.*, d.device_name
-        FROM transfers t
-        LEFT JOIN devices d ON d.id = t.device_id
-        ORDER BY t.id DESC
-        LIMIT ?
+        UPDATE transfers
+        SET uploaded_chunks = ?, status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at)
+        WHERE id = ?
         """,
-        (limit,),
+        (uploaded_chunks, status, utc_now_iso(), completed_at, transfer_id),
     )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    emit_dashboard_update()
+    return query_one("SELECT * FROM transfers WHERE id = ?", (transfer_id,))
+
+
+def assemble_uploaded_file(transfer_id: int):
+    transfer = query_one("SELECT * FROM transfers WHERE id = ?", (transfer_id,))
+    if not transfer:
+        return
+    chunk_dir = partial_dir_for_transfer(transfer_id)
+    final_path = UPLOAD_DIR / transfer["stored_name"]
+    with open(final_path, "wb") as out_f:
+        for idx in range(transfer["total_chunks"]):
+            chunk_path = chunk_dir / f"{idx}.part"
+            if not chunk_path.exists():
+                raise FileNotFoundError(f"Missing chunk {idx}")
+            with open(chunk_path, "rb") as in_f:
+                out_f.write(in_f.read())
+    execute(
+        "UPDATE transfers SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+        ("completed", utc_now_iso(), utc_now_iso(), transfer_id),
+    )
+    emit_dashboard_update()
 
 
 @app.route("/")
-def laptop_dashboard():
+def dashboard():
+    pair_session_id, encrypted_token = create_pair_session()
     base_url = build_base_url()
-    session_id, pair_code = create_pair_session()
-    phone_url = f"{base_url}/phone?pair={pair_code}"
-    devices = list_devices()
-    transfers = list_recent_transfers()
+    phone_url = f"{base_url}/pair?token={encrypted_token}"
     return render_template(
-        "laptop.html",
+        "dashboard.html",
         phone_url=phone_url,
-        pair_code=pair_code,
-        devices=devices,
-        transfers=transfers,
-        poll_seconds=PHONE_POLL_SECONDS,
+        token=encrypted_token,
+        chunk_size=DEFAULT_CHUNK_SIZE,
     )
 
 
 @app.route("/qr")
-def qr_image():
-    phone_url = request.args.get("url", "")
-    if not phone_url:
-        abort(400, "Missing url")
-
-    img = qrcode.make(phone_url)
+def qr_code():
+    url = request.args.get("url", "")
+    if not url:
+        abort(400)
+    img = qrcode.make(url)
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
     return send_file(buffer, mimetype="image/png")
 
 
-@app.route("/phone")
-def phone_page():
-    pair_code = request.args.get("pair", "")
-    return render_template("phone.html", pair_code=pair_code, poll_seconds=PHONE_POLL_SECONDS)
+@app.get("/api/dashboard")
+def api_dashboard():
+    devices = [dict(x) for x in query_all("SELECT * FROM devices ORDER BY last_seen_at DESC")]
+    transfers = [
+        dict(x)
+        for x in query_all(
+            """
+            SELECT t.*, d.device_name
+            FROM transfers t
+            LEFT JOIN devices d ON d.id = t.device_id
+            ORDER BY t.id DESC
+            LIMIT 50
+            """
+        )
+    ]
+    return jsonify({"ok": True, "devices": devices, "transfers": transfers})
 
 
 @app.post("/api/pair")
 def api_pair():
     payload = request.get_json(force=True)
-    pair_code = payload.get("pair_code", "").strip()
-    device_name = payload.get("device_name", "Phone").strip() or "Phone"
-    platform = payload.get("platform", "unknown").strip()
+    encrypted_token = payload.get("encrypted_token", "").strip()
+    device_name = payload.get("device_name", "").strip() or "Android"
+    platform = payload.get("platform", "Android").strip()
 
-    session_row = get_active_pair_session(pair_code)
-    if not session_row:
-        return jsonify({"ok": False, "error": "Pair code is invalid or expired."}), 400
+    pair_session = validate_pair_token(encrypted_token)
+    if not pair_session:
+        return jsonify({"ok": False, "error": "Invalid or expired pairing token."}), 400
 
-    device_id, device_token = upsert_device(device_name, platform, session_row["id"])
-    return jsonify(
-        {
-            "ok": True,
-            "device_token": device_token,
-            "device_id": device_id,
-            "message": "Phone linked successfully.",
-        }
-    )
+    device_id, device_token = create_device(device_name, platform, pair_session["id"])
+    return jsonify({
+        "ok": True,
+        "device_id": device_id,
+        "device_token": device_token,
+        "server_url": build_base_url(),
+        "message": "Pairing complete."
+    })
 
 
-@app.post("/api/phone/upload")
-def api_phone_upload():
-    device_token = request.form.get("device_token", "")
-    device = get_device_by_token(device_token)
+@app.post("/api/phone/upload/init")
+def api_phone_upload_init():
+    payload = request.get_json(force=True)
+    device = get_device_by_token(payload.get("device_token", ""))
     if not device:
         return jsonify({"ok": False, "error": "Unauthorized device."}), 401
 
-    if "file" not in request.files:
-        return jsonify({"ok": False, "error": "No file found in request."}), 400
+    filename = payload["filename"]
+    size_bytes = int(payload["size_bytes"])
+    chunk_size = int(payload.get("chunk_size", DEFAULT_CHUNK_SIZE))
+    total_chunks = int(math.ceil(size_bytes / chunk_size)) if size_bytes > 0 else 1
+    stored_name = f"{uuid.uuid4().hex}_{make_safe_name(filename)}"
+    mime_type = payload.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-    file = request.files["file"]
-    if file.filename == "" or not allowed_file(file.filename):
-        return jsonify({"ok": False, "error": "Invalid file name."}), 400
-
-    stored_name = unique_stored_name(file.filename)
-    save_path = UPLOAD_DIR / stored_name
-    file.save(save_path)
-    size_bytes = save_path.stat().st_size
-    mime_type = file.mimetype or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
-
-    transfer_id = create_transfer_record(
+    transfer_id = register_transfer(
         direction="phone_to_pc",
-        filename=file.filename,
+        filename=filename,
         stored_name=stored_name,
-        size_bytes=size_bytes,
         mime_type=mime_type,
+        size_bytes=size_bytes,
+        chunk_size=chunk_size,
+        total_chunks=total_chunks,
         device_id=device["id"],
-        status="completed",
+        status="initialized",
     )
-    mark_transfer_completed(transfer_id)
     touch_device(device["id"])
+    emit_dashboard_update()
+    return jsonify({
+        "ok": True,
+        "transfer_id": transfer_id,
+        "chunk_size": chunk_size,
+        "total_chunks": total_chunks,
+    })
 
-    return jsonify(
-        {
-            "ok": True,
-            "message": "Upload complete.",
-            "filename": file.filename,
-            "size_bytes": size_bytes,
-        }
+
+@app.get("/api/phone/upload/status/<int:transfer_id>")
+def api_phone_upload_status(transfer_id: int):
+    device = get_device_by_token(request.args.get("device_token", ""))
+    if not device:
+        return jsonify({"ok": False, "error": "Unauthorized device."}), 401
+    transfer = query_one("SELECT * FROM transfers WHERE id = ? AND device_id = ?", (transfer_id, device["id"]))
+    if not transfer:
+        return jsonify({"ok": False, "error": "Transfer not found."}), 404
+    rows = query_all("SELECT chunk_index FROM transfer_chunks WHERE transfer_id = ? ORDER BY chunk_index", (transfer_id,))
+    uploaded = [int(r["chunk_index"]) for r in rows]
+    return jsonify({
+        "ok": True,
+        "transfer_id": transfer_id,
+        "uploaded_chunks": uploaded,
+        "uploaded_count": len(uploaded),
+        "total_chunks": transfer["total_chunks"],
+        "status": transfer["status"],
+    })
+
+
+@app.post("/api/phone/upload/chunk")
+def api_phone_upload_chunk():
+    transfer_id = int(request.form["transfer_id"])
+    chunk_index = int(request.form["chunk_index"])
+    device = get_device_by_token(request.form.get("device_token", ""))
+    if not device:
+        return jsonify({"ok": False, "error": "Unauthorized device."}), 401
+
+    transfer = query_one("SELECT * FROM transfers WHERE id = ? AND device_id = ?", (transfer_id, device["id"]))
+    if not transfer:
+        return jsonify({"ok": False, "error": "Transfer not found."}), 404
+
+    file = request.files.get("chunk")
+    if not file:
+        return jsonify({"ok": False, "error": "Missing chunk."}), 400
+
+    chunk_dir = partial_dir_for_transfer(transfer_id)
+    chunk_path = chunk_dir / f"{chunk_index}.part"
+    file.save(chunk_path)
+    byte_size = chunk_path.stat().st_size
+
+    execute(
+        """
+        INSERT OR IGNORE INTO transfer_chunks (transfer_id, chunk_index, byte_size, received_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (transfer_id, chunk_index, byte_size, utc_now_iso()),
     )
 
+    updated = update_transfer_progress(transfer_id)
+    if updated and int(updated["uploaded_chunks"]) >= int(updated["total_chunks"]):
+        assemble_uploaded_file(transfer_id)
 
-@app.get("/api/laptop/devices")
-def api_laptop_devices():
-    rows = list_devices()
-    result = []
-    for row in rows:
-        result.append(
-            {
-                "id": row["id"],
-                "device_name": row["device_name"],
-                "platform": row["platform"],
-                "last_seen_at": row["last_seen_at"],
-                "linked_at": row["linked_at"],
-                "transfer_count": row["transfer_count"],
-            }
-        )
-    return jsonify({"ok": True, "devices": result})
+    touch_device(device["id"])
+    socketio.emit("transfer_progress", {
+        "transfer_id": transfer_id,
+        "uploaded_chunks": get_transfer_chunk_count(transfer_id),
+        "total_chunks": transfer["total_chunks"],
+        "direction": transfer["direction"],
+        "filename": transfer["filename"],
+    })
+
+    return jsonify({"ok": True, "transfer_id": transfer_id, "chunk_index": chunk_index})
 
 
-@app.get("/api/laptop/transfers")
-def api_laptop_transfers():
-    rows = list_recent_transfers()
-    result = []
-    for row in rows:
-        result.append(
-            {
-                "id": row["id"],
-                "direction": row["direction"],
-                "filename": row["filename"],
-                "size_bytes": row["size_bytes"],
-                "status": row["status"],
-                "device_name": row["device_name"],
-                "created_at": row["created_at"],
-            }
-        )
-    return jsonify({"ok": True, "transfers": result})
+@app.post("/api/laptop/send/init")
+def api_laptop_send_init():
+    device_id = int(request.form["device_id"])
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"ok": False, "error": "Missing file."}), 400
 
-
-@app.post("/api/laptop/send")
-def api_laptop_send():
-    device_id = request.form.get("device_id", type=int)
-    upload = request.files.get("file")
-
-    if not device_id:
-        return jsonify({"ok": False, "error": "Missing device id."}), 400
-
-    if not upload or upload.filename == "":
-        return jsonify({"ok": False, "error": "No file selected."}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM devices WHERE id = ?", (device_id,))
-    device = cur.fetchone()
-    conn.close()
-
+    device = query_one("SELECT * FROM devices WHERE id = ?", (device_id,))
     if not device:
         return jsonify({"ok": False, "error": "Device not found."}), 404
 
-    stored_name = unique_stored_name(upload.filename)
+    filename = file.filename
+    chunk_size = int(request.form.get("chunk_size", DEFAULT_CHUNK_SIZE))
+    stored_name = f"{uuid.uuid4().hex}_{make_safe_name(filename)}"
     save_path = OUTGOING_DIR / stored_name
-    upload.save(save_path)
+    file.save(save_path)
+    size_bytes = save_path.stat().st_size
+    total_chunks = int(math.ceil(size_bytes / chunk_size)) if size_bytes > 0 else 1
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    download_token = secrets.token_urlsafe(32)
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=DOWNLOAD_TOKEN_TTL_MINUTES)).isoformat()
 
-    transfer_id, download_token = create_download_job(device_id, upload.filename, save_path)
-    touch_device(device_id)
-
-    return jsonify(
-        {
-            "ok": True,
-            "message": "File queued for phone download.",
-            "transfer_id": transfer_id,
-            "download_token": download_token,
-        }
+    transfer_id = register_transfer(
+        direction="pc_to_phone",
+        filename=filename,
+        stored_name=stored_name,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        chunk_size=chunk_size,
+        total_chunks=total_chunks,
+        device_id=device_id,
+        status="queued",
+        download_token=download_token,
+        download_expires_at=expires_at,
     )
+    emit_dashboard_update()
+    socketio.emit("phone_job_available", {"device_id": device_id})
+    return jsonify({"ok": True, "transfer_id": transfer_id})
 
 
-@app.get("/api/phone/pending")
-def api_phone_pending():
-    device_token = request.args.get("device_token", "")
-    device = get_device_by_token(device_token)
+@app.get("/api/phone/jobs")
+def api_phone_jobs():
+    device = get_device_by_token(request.args.get("device_token", ""))
     if not device:
         return jsonify({"ok": False, "error": "Unauthorized device."}), 401
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
+    rows = query_all(
         """
-        SELECT id, filename, size_bytes, mime_type, created_at, download_token
+        SELECT id, filename, mime_type, size_bytes, total_chunks, chunk_size, status, created_at
         FROM transfers
-        WHERE device_id = ?
-          AND direction = 'pc_to_phone'
-          AND status = 'queued'
-          AND download_expires_at IS NOT NULL
-          AND download_expires_at > ?
+        WHERE device_id = ? AND direction = 'pc_to_phone' AND download_expires_at > ?
         ORDER BY id DESC
         """,
         (device["id"], utc_now_iso()),
     )
-    rows = cur.fetchall()
-    conn.close()
-
     touch_device(device["id"])
-
-    jobs = []
-    for row in rows:
-        jobs.append(
-            {
-                "id": row["id"],
-                "filename": row["filename"],
-                "size_bytes": row["size_bytes"],
-                "mime_type": row["mime_type"],
-                "created_at": row["created_at"],
-                "download_url": f"/api/phone/download/{row['download_token']}",
-            }
-        )
-
-    return jsonify({"ok": True, "jobs": jobs})
+    return jsonify({"ok": True, "jobs": [dict(r) for r in rows]})
 
 
-@app.get("/api/phone/download/<download_token>")
-def api_phone_download(download_token: str):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM transfers WHERE download_token = ?",
-        (download_token,),
-    )
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        abort(404)
-
-    if row["status"] not in {"queued", "completed"}:
-        conn.close()
-        abort(404)
-
-    if row["download_expires_at"] is None or parse_iso(row["download_expires_at"]) < datetime.now(timezone.utc):
-        conn.close()
-        abort(410)
-
-    file_path = OUTGOING_DIR / row["stored_name"]
-    if not file_path.exists():
-        conn.close()
-        abort(404)
-
-    cur.execute(
-        """
-        UPDATE transfers
-        SET status = ?, downloaded_at = ?, completed_at = ?
-        WHERE id = ?
-        """,
-        ("completed", utc_now_iso(), utc_now_iso(), row["id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    return send_from_directory(
-        OUTGOING_DIR,
-        row["stored_name"],
-        as_attachment=True,
-        download_name=row["filename"],
-        mimetype=row["mime_type"] or "application/octet-stream",
-    )
-
-
-@app.get("/api/phone/me")
-def api_phone_me():
-    device_token = request.args.get("device_token", "")
-    device = get_device_by_token(device_token)
+@app.get("/api/phone/download/status/<int:transfer_id>")
+def api_phone_download_status(transfer_id: int):
+    device = get_device_by_token(request.args.get("device_token", ""))
     if not device:
         return jsonify({"ok": False, "error": "Unauthorized device."}), 401
-
-    touch_device(device["id"])
-    return jsonify(
-        {
-            "ok": True,
-            "device": {
-                "id": device["id"],
-                "device_name": device["device_name"],
-                "platform": device["platform"],
-                "linked_at": device["linked_at"],
-                "last_seen_at": device["last_seen_at"],
-            },
-        }
+    transfer = query_one(
+        "SELECT * FROM transfers WHERE id = ? AND device_id = ? AND direction = 'pc_to_phone'",
+        (transfer_id, device["id"]),
     )
+    if not transfer:
+        return jsonify({"ok": False, "error": "Transfer not found."}), 404
+    return jsonify({
+        "ok": True,
+        "transfer_id": transfer_id,
+        "filename": transfer["filename"],
+        "chunk_size": transfer["chunk_size"],
+        "total_chunks": transfer["total_chunks"],
+        "size_bytes": transfer["size_bytes"],
+    })
+
+
+@app.get("/api/phone/download/chunk/<int:transfer_id>/<int:chunk_index>")
+def api_phone_download_chunk(transfer_id: int, chunk_index: int):
+    device = get_device_by_token(request.args.get("device_token", ""))
+    if not device:
+        return jsonify({"ok": False, "error": "Unauthorized device."}), 401
+    transfer = query_one(
+        "SELECT * FROM transfers WHERE id = ? AND device_id = ? AND direction = 'pc_to_phone'",
+        (transfer_id, device["id"]),
+    )
+    if not transfer:
+        return jsonify({"ok": False, "error": "Transfer not found."}), 404
+
+    file_path = OUTGOING_DIR / transfer["stored_name"]
+    if not file_path.exists():
+        abort(404)
+
+    chunk_size = int(transfer["chunk_size"])
+    offset = chunk_index * chunk_size
+    with open(file_path, "rb") as f:
+        f.seek(offset)
+        data = f.read(chunk_size)
+    if data is None:
+        abort(404)
+
+    if chunk_index + 1 >= int(transfer["total_chunks"]):
+        execute(
+            "UPDATE transfers SET status = ?, downloaded_at = ?, completed_at = ?, updated_at = ? WHERE id = ?",
+            ("completed", utc_now_iso(), utc_now_iso(), utc_now_iso(), transfer_id),
+        )
+        emit_dashboard_update()
+
+    return send_file(io.BytesIO(data), mimetype="application/octet-stream", download_name=f"chunk-{chunk_index}.bin")
+
+
+@app.get("/pair")
+def pair_landing():
+    token = request.args.get("token", "")
+    return jsonify({
+        "message": "Use the Android app to scan the QR or paste this token.",
+        "encrypted_token": token,
+        "server": build_base_url(),
+    })
+
+
+@socketio.on("connect")
+def handle_connect():
+    emit("connected", {"ok": True})
+
+
+@socketio.on("hello_phone")
+def handle_hello_phone(data):
+    emit("hello_ack", {"ok": True, "message": "Phone connected to live channel."})
 
 
 if __name__ == "__main__":
     init_db()
-    host = os.environ.get("APP_HOST", "0.0.0.0")
-    port = int(os.environ.get("APP_PORT", 5000))
-    app.run(host=host, port=port, debug=True)
+    socketio.run(app, host=APP_HOST, port=APP_PORT, debug=True)

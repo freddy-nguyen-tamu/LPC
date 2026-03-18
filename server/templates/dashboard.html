@@ -1,0 +1,55 @@
+{% extends 'base.html' %}
+{% block content %}
+<header class="hero">
+  <div>
+    <p class="eyebrow">Transfer Pro</p>
+    <h1>Phone ↔ Laptop Secure Transfer</h1>
+    <p class="sub">Chunked. Resumable. Encrypted pairing. Live updates.</p>
+  </div>
+</header>
+
+<section class="grid">
+  <div class="panel">
+    <h2>Pair Android client</h2>
+    <div class="qr-zone">
+      <img src="{{ url_for('qr_code') }}?url={{ phone_url | urlencode }}" alt="QR Code">
+    </div>
+    <div class="token-box">
+      <div class="label">Encrypted pair token</div>
+      <div class="mono break">{{ token }}</div>
+    </div>
+    <div class="token-box">
+      <div class="label">QR URL</div>
+      <div class="mono break">{{ phone_url }}</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Send file to phone</h2>
+    <form id="sendForm" class="stack">
+      <label>Linked device</label>
+      <select name="device_id" id="deviceSelect" required></select>
+
+      <label>File</label>
+      <input type="file" name="file" required>
+
+      <label>Chunk size</label>
+      <input type="number" name="chunk_size" value="{{ chunk_size }}" min="65536" step="65536">
+
+      <button type="submit">Queue transfer</button>
+      <div id="sendStatus" class="status"></div>
+    </form>
+  </div>
+</section>
+
+<section class="grid second">
+  <div class="panel">
+    <h2>Devices</h2>
+    <div id="devices"></div>
+  </div>
+  <div class="panel">
+    <h2>Transfers</h2>
+    <div id="transfers"></div>
+  </div>
+</section>
+{% endblock %}
