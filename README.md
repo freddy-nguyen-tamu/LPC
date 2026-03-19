@@ -8,7 +8,7 @@
 ## Install
 
 ```bash
-cd phone_laptop_transfer
+cd lpc
 python -m venv .venv
 ````
 
