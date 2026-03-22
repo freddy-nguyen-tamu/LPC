@@ -1,103 +1,99 @@
-# LTC Laptop ↔  Phone Connect
+# HOW TO RUN THE SERVER
 
-## Requirements
-
-- Python 3.10+
-- Laptop and phone on the same Wi‑Fi/LAN
-
-## Install
-
-```bash
-cd lpc
-python -m venv .venv
-````
+## 34) Create and activate virtual environment
 
 ### Windows PowerShell
 
 ```powershell
+cd phone_laptop_transfer_pro\server
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+```
+
+## 35) Generate encryption key
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Copy the printed key.
+
+## 36) Set environment variables and run
+
+```powershell
+$env:FERNET_KEY="PASTE_THE_KEY_HERE"
+$env:APP_SECRET="replace-this-with-a-random-secret"
 python app.py
 ```
 
-### macOS / Linux
-
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
-
-## Open
-
-On the laptop, open:
+Open on laptop:
 
 ```text
 http://127.0.0.1:5000
 ```
 
-The page will show a QR code. Scan it with your phone camera.
+---
 
-## Where files go
+# HOW TO BUILD WINDOWS EXE
 
-* Phone → Laptop uploads are saved in:
+Inside `phone_laptop_transfer_pro/server`:
 
-  * `uploads/`
-* Laptop → Phone files are temporarily saved in:
+```powershell
+pip install pyinstaller
+pyinstaller phone_laptop_transfer.spec
+```
 
-  * `outgoing/`
-* Pairing and transfer history are stored in:
+Your Windows executable will be created under:
 
-  * `data/app.db`
-
-## Notes
-
-* This build uses **Flask** for the app server.
-* It uses **SQLite** so SQL is part of the project.
-* Phone side is a browser app for easier cross-platform use.
-* For larger files, performance is mostly limited by your Wi‑Fi speed.
-
-## Good next upgrades
-
-* End-to-end encryption for files
-* Resume interrupted transfers
-* Drag-and-drop on laptop UI
-* Multi-file upload queue
-* Native Android/iOS wrapper
-* WebSocket live updates instead of polling
-
+```text
+phone_laptop_transfer_pro/server/dist/TransferProServer.exe
 ```
 
 ---
 
-## How the SQL requirement is satisfied
+# HOW TO BUILD ANDROID APK
 
-This project uses **SQLite** with SQL tables for:
+1. Open `phone_laptop_transfer_pro/android` in Android Studio.
+2. Let Gradle sync.
+3. Build with:
 
-- `pair_sessions`
-- `devices`
-- `transfers`
-
-SQL is directly used in `app.py` through `CREATE TABLE`, `INSERT`, `SELECT`, and `UPDATE` statements.
-
----
-
-## How to run
-
-1. Create the folder tree exactly as shown.
-2. Copy each code block into the matching file path.
-3. Install dependencies from `requirements.txt`.
-4. Run `python app.py` on the laptop.
-5. Open `http://127.0.0.1:5000` on the laptop.
-6. Scan the QR code with the phone.
-7. Link the phone once.
-8. Transfer files both directions.
+   * **Build > Build APK(s)**
+4. Install APK on Android phone.
+5. Run the laptop server.
+6. Open app on Android.
+7. Scan or copy the QR token/server URL.
+8. Pair once.
+9. Upload/download files.
 
 ---
 
-## Important limitations
+# IMPORTANT NOTES
 
-- This version works over the **same local network**.
-- On iPhone, browser downloads follow Safari’s download behavior.
-- On some networks, firewall rules may block the laptop port `5000`.
-- This is a solid prototype / MVP, not yet a hardened production app.
+## What is production-grade here
+
+Compared to the earlier prototype, this version adds:
+
+* resumable **chunked upload** from Android to laptop
+* chunk-based **download** from laptop to Android
+* **live updates** using Socket.IO on the laptop dashboard
+* **encrypted pairing token** using Fernet
+* **native Android app source** instead of browser only
+* **Windows packaging** with PyInstaller
+* improved UI styling
+
+## What still needs hardening for real commercial release
+
+This code is strong as a serious starter, but for a true commercial release you would still want:
+
+* authenticated WebSocket namespaces per device
+* TLS/HTTPS certificates instead of plain LAN HTTP
+* transfer checksum verification per chunk and full file hash
+* background Android transfer service with notifications
+* persistent Android storage of device token using DataStore
+* QR scanner screen embedded directly in app UI
+* download resume bookkeeping stored locally on Android
+* delta retry/backoff logic
+* multi-device access controls
+* desktop tray app and auto-start service
+* installer creation for Windows using Inno Setup or MSIX
