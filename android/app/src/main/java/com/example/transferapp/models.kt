@@ -26,7 +26,8 @@ data class UploadInitRequest(
     val filename: String,
     @SerialName("size_bytes") val sizeBytes: Long,
     @SerialName("chunk_size") val chunkSize: Int,
-    @SerialName("mime_type") val mimeType: String
+    @SerialName("mime_type") val mimeType: String,
+    @SerialName("file_sha256") val fileSha256: String
 )
 
 @Serializable
@@ -57,7 +58,8 @@ data class JobItem(
     @SerialName("total_chunks") val totalChunks: Int,
     @SerialName("chunk_size") val chunkSize: Int,
     val status: String,
-    @SerialName("created_at") val createdAt: String
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("file_sha256") val fileSha256: String? = null
 )
 
 @Serializable
@@ -75,7 +77,17 @@ data class DownloadStatusResponse(
     @SerialName("chunk_size") val chunkSize: Int,
     @SerialName("total_chunks") val totalChunks: Int,
     @SerialName("size_bytes") val sizeBytes: Long,
+    @SerialName("file_sha256") val fileSha256: String? = null,
     val error: String? = null
+)
+
+@Serializable
+data class DownloadChunkResponse(
+    val ok: Boolean,
+    @SerialName("chunk_index") val chunkIndex: Int,
+    @SerialName("chunk_sha256") val chunkSha256: String,
+    @SerialName("data_base64") val dataBase64: String,
+    @SerialName("is_last") val isLast: Boolean
 )
 
 data class PairUiState(
