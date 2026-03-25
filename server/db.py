@@ -57,6 +57,7 @@ def init_db():
             chunk_size INTEGER NOT NULL,
             total_chunks INTEGER NOT NULL,
             uploaded_chunks INTEGER NOT NULL DEFAULT 0,
+            file_sha256 TEXT,
             status TEXT NOT NULL,
             device_id INTEGER,
             created_at TEXT NOT NULL,
@@ -77,6 +78,7 @@ def init_db():
             transfer_id INTEGER NOT NULL,
             chunk_index INTEGER NOT NULL,
             byte_size INTEGER NOT NULL,
+            chunk_sha256 TEXT NOT NULL,
             received_at TEXT NOT NULL,
             UNIQUE(transfer_id, chunk_index),
             FOREIGN KEY(transfer_id) REFERENCES transfers(id)
@@ -114,12 +116,3 @@ def execute(sql: str, params=()):
     lastrowid = cur.lastrowid
     conn.close()
     return lastrowid
-
-
-def execute_many(statements):
-    conn = get_db()
-    cur = conn.cursor()
-    for sql, params in statements:
-        cur.execute(sql, params)
-    conn.commit()
-    conn.close()
