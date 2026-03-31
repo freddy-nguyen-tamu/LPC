@@ -57,7 +57,7 @@ def get_local_ip():
 
 def build_base_url() -> str:
     host = APP_PUBLIC_HOST or get_local_ip()
-    return f"https://{host}:{APP_PORT}"
+    return f"http://{host}:{APP_PORT}"
 
 
 def build_ssl_context():
@@ -550,4 +550,4 @@ def handle_connect():
 
 if __name__ == "__main__":
     init_db()
-    socketio.run(app, host=APP_HOST, port=APP_PORT, debug=True, ssl_context=build_ssl_context())
+    socketio.run(app, host=APP_HOST, port=APP_PORT, debug=True)
